@@ -1,0 +1,460 @@
+diff --git a/Makefile.am b/Makefile.am
+index 5c07059..ce49289 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -81,6 +81,7 @@ noinst_HEADERS = \
+ 	lib/alg-sha256.h \
+ 	lib/alg-sha512.h \
+ 	lib/alg-yescrypt.h \
++	lib/alg-tpmhmac.h \
+ 	lib/byteorder.h \
+ 	lib/crypt-obsolete.h \
+ 	lib/crypt-port.h \
+@@ -110,6 +111,7 @@ libcrypt_la_SOURCES = \
+ 	lib/alg-sha512.c \
+ 	lib/alg-yescrypt-common.c \
+ 	lib/alg-yescrypt-opt.c \
++	lib/alg-tpmhmac.c \
+ 	lib/crypt-bcrypt.c \
+ 	lib/crypt-des.c \
+ 	lib/crypt-gensalt-static.c \
+@@ -123,6 +125,7 @@ libcrypt_la_SOURCES = \
+ 	lib/crypt-static.c \
+ 	lib/crypt-sunmd5.c \
+ 	lib/crypt-yescrypt.c \
++	lib/crypt-tpmhmac.c \
+ 	lib/crypt.c \
+ 	lib/util-base64.c \
+ 	lib/util-gensalt-sha.c \
+diff --git a/lib/alg-tpmhmac.c b/lib/alg-tpmhmac.c
+new file mode 100644
+index 0000000..2fb9591
+--- /dev/null
++++ b/lib/alg-tpmhmac.c
+@@ -0,0 +1,211 @@
++/* alg-tpmhmac.c */
++
++/* HMAC with a tpm key
++ * This program generates a password hash based on a TPM HMAC with a secret key.
++ * Since the HMAC key is locked to the hardware TPM, the password hashes cannot be cracked remotely.
++ *
++ * This program assumes an hmac key's public and private files exist,
++ * and can be loaded at a specified persistent storaqge key handle.
++ * For example, with a DRSK at 0x81000004
++ *   tpm2_create -C 0x81000004 -G hmac -a "sensitivedataorigin|userwithauth|sign" -u hmac.pub -r hmac.priv
++ * This program then does the equivalent of
++ *   tpm2_load -C 0x81000004 -u hmac.pub -r hmac.priv -c hmac.ctx
++ *   tpm2_hmac -c hmac.ctx --hex password.txt
++ *   1ea76873a106c2b58c225cc5479db3e698f0e30e80d76a89f085c59aedd5b12b
++ */
++
++#include <stdlib.h>
++#include <stdio.h>
++#include <errno.h>
++#include <string.h>
++#include "alg-tpmhmac.h"
++#include <tss2/tss2_mu.h>
++
++/* file read helpers from tpm2-tools */
++static UINT16 readx(FILE *f, UINT8 *data, UINT16 size) {
++    UINT16 bread = 0;
++    do {
++        bread += (UINT16)fread(&data[bread], 1, size-bread, f);
++    } while (bread < size && !feof(f) && errno == EINTR);
++    return bread;
++}
++
++static int files_get_file_size(FILE *fp, unsigned long *file_size, const char *path) {
++    long current, size;
++    int rc;
++
++    current = ftell(fp);
++    if (current < 0) {
++        if (path)
++            return 0;
++    }
++
++    rc = fseek(fp, 0, SEEK_END);
++    if (rc < 0) {
++        if (path)
++            return 0;
++    }
++
++    size = ftell(fp);
++    if (size < 0) {
++        if (path)
++            return 0;
++    }
++
++    rc = fseek(fp, current, SEEK_SET);
++    if (rc < 0) {
++        if (path)
++            return 0;
++    }
++
++    /* size cannot be negative at this point */
++    *file_size = (unsigned long) size;
++    return 1;
++}
++
++static int file_read_bytes_from_file(FILE *f, UINT8 *buf, UINT16 *size, const char *path) {
++
++    unsigned long file_size;
++    int result;
++
++    result = files_get_file_size(f, &file_size, path);
++    if (!result)
++        return 0;
++
++    /* max is bounded on *size */
++    if (file_size > *size) {
++        if (path)
++        return 0;
++    }
++
++    *size = readx(f, buf, *size);
++    if (*size < file_size) {
++        if (path)
++            return 0;
++    }
++
++    return 1;
++}
++
++static int files_load_bytes_from_path(const char *path, UINT8 *buf, UINT16 *size) {
++    int result;
++    FILE *f;
++
++    if (!buf || !size || !path) {
++        return 0;
++    }
++
++    f = fopen(path, "rb");
++    if (!f)
++        return 0;
++
++    result = file_read_bytes_from_file(f, buf, size, path);
++
++    fclose(f);
++    return result;
++}
++
++/* load hmac key from pub and priv files, to specified persistent handle, and do hmac on buffer
++ * parent is the uint32_t parent key handle, such as 0x81000004
++ * pubpath is the path to the hmac key's public file
++ * privpath is the path the the hmac key's private file (which is encrypted by the TPM)
++ */
++int do_hmac(TPM2B_MAX_BUFFER *in, TPM2B_DIGEST **out, uint32_t parent,
++            const char *pubpath, const char *privpath) {
++    ESYS_TR parent_tr, hmac_tr;
++    ESYS_CONTEXT *ctx;
++    TPM2B_PUBLIC public;
++    TPM2B_PRIVATE private;
++    UINT8 pubbuffer[512];
++    UINT16 pubsize = sizeof(pubbuffer);
++    UINT8 privbuffer[512];
++    UINT16 privsize = sizeof(privbuffer);
++    TSS2_RC r;
++    int res;
++    size_t offset = 0;
++
++    /* Initialize the ESAPI context */
++    r = Esys_Initialize(&ctx, NULL, NULL);
++    if (r != TSS2_RC_SUCCESS){
++        printf("\nError: Esys_Initialize\n");
++        return -1;
++    }
++
++    /* get ESYS_TR from specified persistent parent handle */
++    r = Esys_TR_FromTPMPublic(
++        ctx,
++        parent,
++        ESYS_TR_NONE,
++        ESYS_TR_NONE,
++        ESYS_TR_NONE,
++        &parent_tr);
++    if (r != TSS2_RC_SUCCESS){
++        printf("\nError: Esys_Initializen\n");
++        return -2;
++    }
++
++    /* read in hmac key pub and deserialize */
++    memset(pubbuffer, 0, sizeof(pubbuffer));
++    res = files_load_bytes_from_path(pubpath, pubbuffer, &pubsize);
++    if (!res) {
++        printf("Error loading hmac public key %s %d\n", pubpath, pubsize);
++        return -3;
++    }
++    /* have to clear this buffer due to lame tss library */
++    memset(&public, 0, sizeof(public));
++    offset = 0;
++    r = Tss2_MU_TPM2B_PUBLIC_Unmarshal(pubbuffer, pubsize, &offset, &public);
++    if (r != TSS2_RC_SUCCESS) {
++        printf("\nError: Esys_Unmarshall public\n");
++        return -4;
++    }
++
++    /* read in hmac priv and deserialize */
++    memset(privbuffer, 0, sizeof(privbuffer));
++    res = files_load_bytes_from_path(privpath, privbuffer, &privsize);
++    if (!res) {
++        printf("Error loading hmac private key %s %d\n", privpath, privsize);
++        return -5;
++    }
++    /* have to clear this buffer due to lame tss library */
++    memset(&private, 0, sizeof(private));
++    offset = 0;
++    r = Tss2_MU_TPM2B_PRIVATE_Unmarshal(privbuffer, privsize, &offset, &private);
++    if (r != TSS2_RC_SUCCESS) {
++        printf("\nError: Esys_Unmarshal private\n");
++        return -6;
++    }
++
++    /* load hmac key under parent */
++    r = Esys_Load(
++        ctx,
++        parent_tr,
++        ESYS_TR_PASSWORD,
++        ESYS_TR_NONE,
++        ESYS_TR_NONE,
++        &private,                  //tpm2b_private *
++        &public,                   //tpm2b_public *
++        &hmac_tr);
++    if (r != TSS2_RC_SUCCESS) {
++        printf("\nError: Esys_Load\n");
++        return -7;
++    }
++
++    /* do the hmac with that key */
++    r = Esys_HMAC(
++        ctx,                      // esys context
++        hmac_tr,                  // handle to loaded hmac key
++        ESYS_TR_PASSWORD,         // auth session handle
++        ESYS_TR_NONE,
++        ESYS_TR_NONE,
++        in,                       // input buffer
++        TPM2_ALG_SHA256,
++        out);
++    if (r != TSS2_RC_SUCCESS) {
++        printf("\nError: Esys_HMAC\n");
++        return -8;
++    }
++
++    return 0;
++}
++
+diff --git a/lib/alg-tpmhmac.h b/lib/alg-tpmhmac.h
+new file mode 100644
+index 0000000..2fa43a3
+--- /dev/null
++++ b/lib/alg-tpmhmac.h
+@@ -0,0 +1,3 @@
++/* alg-tpmhmac.h */
++#include <tss2/tss2_esys.h>
++int do_hmac(TPM2B_MAX_BUFFER *in, TPM2B_DIGEST **out, uint32_t parent, const char *pubpath, const char *privpath);
+diff --git a/lib/crypt-tpmhmac.c b/lib/crypt-tpmhmac.c
+new file mode 100644
+index 0000000..6166762
+--- /dev/null
++++ b/lib/crypt-tpmhmac.c
+@@ -0,0 +1,188 @@
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "crypt-port.h"
++#include "alg-tpmhmac.h"
++
++#define DEFAULT_CONFIG_PATH "/etc/tpmhmac.conf"
++#define DEFAULT_PARENT_INT 0x81000004
++#define DEFAULT_PARENT_STRING "0x81000004"
++#define DEFAULT_BASE_PATH "/etc/hmac."
++#define DEFAULT_PUB "pub"
++#define DEFAULT_PRIV "priv"
++#define TPMHMAC_PREFIX "$t$"
++
++#define b64_from_24bit(B2, B1, B0, N)                   \
++  do {                                                  \
++    unsigned int w = ((((unsigned int)(B2)) << 16) |    \
++                      (((unsigned int)(B1)) << 8) |     \
++                      ((unsigned int)(B0)));            \
++    int n = (N);                                        \
++    while (n-- > 0)                                     \
++      {                                                 \
++        *p++ = b64t[w & 0x3f];                          \
++        w >>= 6;                                        \
++      }                                                 \
++  } while (0)
++
++/*
++ * Read in /etc/tpmhmac.conf to get parent and key file path
++ */
++void getparams(char *cparent, char *basepath) {
++    FILE *fp;
++    char *line, cp[12], bp[128];
++    size_t n;
++
++    /* set defaults */
++    strcpy(cparent, DEFAULT_PARENT_STRING);
++    strcpy(basepath, DEFAULT_BASE_PATH);
++
++    fp = fopen(DEFAULT_CONFIG_PATH, "r");
++    if (!fp)
++        return;
++    while(getline(&line, &n, fp) != EOF){
++        /* ignore comment lines */
++        if(line[0] == '#')
++            continue;
++        if(sscanf(line, "PARENT_HANDLE=%s", cp) == 1)
++            strcpy(cparent, cp);
++        if(sscanf(line, "BASE_PATH=%s", bp) == 1)
++            strcpy(basepath, bp);
++    }
++}
++
++/* settings string should look like:
++ * $ t $ parent_handle $ base_path $ salt $
++ * e.g. $t$0x81000004$/etc/tpmhmac.$<b64_salt[22]>$
++ */
++void gensalt_tpmhmaccrypt_rn (unsigned long count,
++                              const uint8_t *rbytes, size_t nrbytes,
++                              uint8_t *output, size_t output_size)
++{
++    char *p = (char *)output;
++    char basepath[128];
++    char cparent[12];
++    size_t l;
++    count++;  /* we ingore the count */
++
++    memset(output, 0, output_size);
++
++    if (nrbytes < 16)
++      return;
++
++    getparams(cparent, basepath);
++    l = strlen(TPMHMAC_PREFIX) + strlen(cparent) + strlen(basepath) + 2;
++
++    if(output_size < (l + 3 + 1 + 22 + 1 + 1))
++      return;
++
++    snprintf(p, output_size, "%s%s$%s$", TPMHMAC_PREFIX, cparent, basepath);
++    p += l;
++
++    /* b64 the 16 bytes of salt to 22 characters */
++    b64_from_24bit (rbytes[0], rbytes[1], rbytes[2], 4);
++    b64_from_24bit (rbytes[3], rbytes[4], rbytes[5], 4);
++    b64_from_24bit (rbytes[6], rbytes[7], rbytes[8], 4);
++    b64_from_24bit (rbytes[9], rbytes[10], rbytes[11], 4);
++    b64_from_24bit (rbytes[12], rbytes[13], rbytes[14], 4);
++    b64_from_24bit (rbytes[15], 0, 0, 2);
++
++    *p = '$';
++}
++
++/*
++ * Everything is already allocated.
++ * setting should be: $t$ cparent $ basepath $ salt[22] $ [ prior hmac if verifying!]
++ */
++void crypt_tpmhmaccrypt_rn (const char *phrase, size_t phr_size,
++                            const char *setting, size_t set_size,
++                            uint8_t *output, size_t out_size,
++                            void *scratch, size_t scr_size)
++{
++    const char *s;
++    const char *salt;
++
++    TPM2B_MAX_BUFFER in;
++    TPM2B_DIGEST *hmac;
++    char cparent[32];
++    char basepath[128];
++    uint32_t parent;
++    char pubpath[256];
++    char privpath[256];
++    int r;
++    size_t l;
++    char *p = (char *)output;
++    char *d;
++
++    /* we don't use scratch */
++    memset(scratch, 0, scr_size);
++    memset(&in, 0, sizeof(in));
++    memset(output, 0, out_size);
++
++    /* simple sanity checks */
++    if (!strncmp (TPMHMAC_PREFIX, setting, 3) == 0) {
++        errno = EINVAL;
++        return;
++    }
++    if (set_size < (3 + 22 + 4))
++        return;
++
++    /* find and copy cparent */
++    for(s=setting+3,d=cparent;s!=setting+set_size;s++,d++) {
++        *d = *s;
++        if(*d == '$') {
++            *d = '\0';
++            break;
++        }
++    }
++
++    /* find and copy basepath */
++    for(s=s+1,d=basepath;s!=setting+set_size;s++,d++) {
++        *d = *s;
++        if(*d == '$') {
++            *d = '\0';
++            break;
++        }
++    }
++
++    /* salt is next */
++    salt = s + 1;
++
++    parent = (uint32_t)strtoul(cparent,NULL, 0);
++    snprintf(pubpath, sizeof(pubpath), "%spub", basepath);
++    snprintf(privpath, sizeof(privpath), "%spriv", basepath);
++
++    /* Get the salt and password and copy them to the in buffer.
++     * We could decode the b64 salt, but let's just hmac it as is
++     */
++    memcpy(in.buffer, salt, 22);
++    memcpy(in.buffer + 22, phrase, phr_size);
++    in.size = (UINT16) (22 + phr_size);
++    in.buffer[in.size] = '\0';
++
++    r = do_hmac(&in, &hmac, parent, pubpath, privpath);
++    if (r != TSS2_RC_SUCCESS)
++        return;
++
++    /* output the setting string JUST THRU THE SALT and TRAILING $ */
++    l = (size_t)(salt - setting) + 23;
++    if (out_size < l + 43)
++        return;
++    memcpy(p, setting, l);
++    p += l;
++
++    /* output b64 of the hmac   [ie 32 bytes of hmac to 43 characters] */
++    b64_from_24bit (hmac->buffer[0], hmac->buffer[1], hmac->buffer[2], 4);
++    b64_from_24bit (hmac->buffer[3], hmac->buffer[4], hmac->buffer[5], 4);
++    b64_from_24bit (hmac->buffer[6], hmac->buffer[7], hmac->buffer[8], 4);
++    b64_from_24bit (hmac->buffer[9], hmac->buffer[10], hmac->buffer[11], 4);
++    b64_from_24bit (hmac->buffer[12], hmac->buffer[13], hmac->buffer[14], 4);
++    b64_from_24bit (hmac->buffer[15], hmac->buffer[16], hmac->buffer[17], 4);
++    b64_from_24bit (hmac->buffer[18], hmac->buffer[19], hmac->buffer[20], 4);
++    b64_from_24bit (hmac->buffer[21], hmac->buffer[22], hmac->buffer[23], 4);
++    b64_from_24bit (hmac->buffer[24], hmac->buffer[25], hmac->buffer[26], 4);
++    b64_from_24bit (hmac->buffer[27], hmac->buffer[28], hmac->buffer[29], 4);
++    b64_from_24bit (hmac->buffer[30], hmac->buffer[31], 0, 3);
++    *p = '\0';
++}
+diff --git a/lib/hashes.conf b/lib/hashes.conf
+index 094f7cc..df0a288 100644
+--- a/lib/hashes.conf
++++ b/lib/hashes.conf
+@@ -39,6 +39,7 @@
+ # supported hashes).
+ #
+ #name          h_prefix  nrbytes  flags
++tpmhmaccrypt   $t$	 16	  STRONG,DEFAULT
+ yescrypt       $y$       16       STRONG,DEFAULT,ALT,DEBIAN,FEDORA
+ gost_yescrypt  $gy$      16       STRONG,ALT
+ scrypt         $7$       16       STRONG

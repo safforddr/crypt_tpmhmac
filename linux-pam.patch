@@ -1,0 +1,51 @@
+diff --git a/modules/pam_unix/passverify.c b/modules/pam_unix/passverify.c
+index 81b10d88..91d0d074 100644
+--- a/modules/pam_unix/passverify.c
++++ b/modules/pam_unix/passverify.c
+@@ -435,6 +435,8 @@ PAMH_ARG_DECL(char * create_password_hash,
+ 	if (on(UNIX_MD5_PASS, ctrl)) {
+ 		/* algoid = "$1" */
+ 		return crypt_md5_wrapper(password);
++	} else if (on(UNIX_TPMHMAC_PASS, ctrl)) {
++		algoid = "$t$";		
+ 	} else if (on(UNIX_YESCRYPT_PASS, ctrl)) {
+ 		algoid = "$y$";
+ 	} else if (on(UNIX_GOST_YESCRYPT_PASS, ctrl)) {
+@@ -486,6 +488,7 @@ PAMH_ARG_DECL(char * create_password_hash,
+ #endif
+ 	if (!sp || strncmp(algoid, sp, strlen(algoid)) != 0) {
+ 		/* libxcrypt/libc doesn't know the algorithm, error out */
++		pam_syslog(pamh, LOG_ERR, "sp returned %s\n",sp);
+ 		pam_syslog(pamh, LOG_ERR,
+ 			   "Algo %s not supported by the crypto backend.\n",
+ 			   on(UNIX_YESCRYPT_PASS, ctrl) ? "yescrypt" :
+diff --git a/modules/pam_unix/support.h b/modules/pam_unix/support.h
+index 81054002..a7f2b205 100644
+--- a/modules/pam_unix/support.h
++++ b/modules/pam_unix/support.h
+@@ -100,11 +100,12 @@ typedef struct {
+ #define UNIX_DES                 30     /* DES, default */
+ #define UNIX_GOST_YESCRYPT_PASS  31     /* new password hashes will use gost-yescrypt */
+ #define UNIX_YESCRYPT_PASS       32     /* new password hashes will use yescrypt */
+-#define UNIX_NULLRESETOK         33     /* allow empty password if password reset is enforced */
++#define UNIX_TPMHMAC_PASS        33
++#define UNIX_NULLRESETOK         34     /* allow empty password if password reset is enforced */
+ /* -------------- */
+-#define UNIX_CTRLS_              34	/* number of ctrl arguments defined */
++#define UNIX_CTRLS_              35	/* number of ctrl arguments defined */
+ 
+-#define UNIX_DES_CRYPT(ctrl)	(off(UNIX_MD5_PASS,ctrl)&&off(UNIX_BIGCRYPT,ctrl)&&off(UNIX_SHA256_PASS,ctrl)&&off(UNIX_SHA512_PASS,ctrl)&&off(UNIX_BLOWFISH_PASS,ctrl)&&off(UNIX_GOST_YESCRYPT_PASS,ctrl)&&off(UNIX_YESCRYPT_PASS,ctrl))
++#define UNIX_DES_CRYPT(ctrl)	(off(UNIX_MD5_PASS,ctrl)&&off(UNIX_BIGCRYPT,ctrl)&&off(UNIX_SHA256_PASS,ctrl)&&off(UNIX_SHA512_PASS,ctrl)&&off(UNIX_BLOWFISH_PASS,ctrl)&&off(UNIX_GOST_YESCRYPT_PASS,ctrl)&&off(UNIX_YESCRYPT_PASS,ctrl)&&off(UNIX_TPMHMAC_PASS,ctrl))
+ 
+ static const UNIX_Ctrls unix_args[UNIX_CTRLS_] =
+ {
+@@ -144,7 +145,8 @@ static const UNIX_Ctrls unix_args[UNIX_CTRLS_] =
+ /* UNIX_DES */                 {"des",              _ALL_ON_^(015660420000ULL),             0, 1},
+ /* UNIX_GOST_YESCRYPT_PASS */  {"gost_yescrypt",    _ALL_ON_^(015660420000ULL),   04000000000, 1},
+ /* UNIX_YESCRYPT_PASS */       {"yescrypt",         _ALL_ON_^(015660420000ULL),  010000000000, 1},
+-/* UNIX_NULLRESETOK */         {"nullresetok",      _ALL_ON_,                    020000000000, 0},
++/* UNIX_TPMHMAC_PASS */        {"tpmhmac",          _ALL_ON_^(015660420000ULL),  020000000000, 1},
++/* UNIX_NULLRESETOK */         {"nullresetok",      _ALL_ON_,                    040000000000, 0},
+ };
+ 
+ #define UNIX_DEFAULTS  (unix_args[UNIX__NONULL].flag)
