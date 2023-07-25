@@ -4,7 +4,7 @@ Use a TPM based hmac for shadow passwords
 These patches to libxcrypt and pam provide a shadow password hash
 that cannot be compromised in an offline attack. A local hardware
 TPM is used to HMAC the salt and passphrase to generate the hash.
-Since am attacker cannot obtain the TPM's HMAC key, there is no
+Since an attacker cannot obtain the TPM's HMAC key, there is no
 way to mount any offline attacks. Details are provided in tpmhmac.doc
 These patches were developed on Fedora 38. YMMV.
 
@@ -14,7 +14,7 @@ Installation:
 2. copy tpmhmac.conf to /etc
 3. Provision your TPM as with an SRK and optionally a DRSK as described in the TPM_KEYS repository.
 4. create the HMAC keys. For example, with a DRSK at 0x81000004
-      tpm2_create -C 0x81000004 -G hmac -a "sensitivedataorigin|userwithauth|sign" -u hmac.pub -r hmac.priv
+      "tpm2_create -C 0x81000004 -G hmac -a "sensitivedataorigin|userwithauth|sign" -u hmac.pub -r hmac.priv"
    and place them in /etc.
    (The parent key handle and hmac key filenames can be tailored in /etc/tpmhmac.conf.)
 5. in /etc/login.defs change ENCRYPT_METHOD to
