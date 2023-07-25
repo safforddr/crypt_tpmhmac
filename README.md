@@ -22,7 +22,11 @@ Installation:
 6. update the selinux policy to allow passwd, unix_chkpwd, and su to access the TPM.
    The easiest way to do this is run each command, and when they fail, check journalctl,
    Which will have detailed instructions on how to add the needed rules to the current policy. 
-   This need only be done once for each command.
+   This need only be done once for each command. This will look something like
+
+   ausearch -c 'passwd' --raw | audit2allow -M my-passwd
+
+   semodule -X 300 -i my-passwd.pp
        
 All new password hashes will now use the TPM. Existing hashes continue to use their existing hash
 even when updated with passwd. To force en existing hash to change to tpmhmac, you have to delete
